@@ -1,0 +1,39 @@
+{
+  "name": "orbit-ide",
+  "productName": "Orbit",
+  "version": "0.1.0",
+  "description": "A focused desktop IDE with an editor built from scratch.",
+  "private": true,
+  "packageManager": "pnpm@11.25.0",
+  "engines": { "node": ">=22.18.0", "pnpm": ">=10" },
+  "type": "module",
+  "main": "dist/main.cjs",
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "build": "node scripts/build.mjs",
+    "start": "node scripts/start.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test tests/*.test.ts",
+    "test:app": "node scripts/smoke.mjs",
+    "test:package": "node scripts/smoke.mjs --packaged",
+    "package": "node scripts/package.mjs"
+  },
+  "dependencies": {
+    "@lydell/node-pty": "^1.1.0",
+    "@xterm/addon-fit": "^0.10.0",
+    "@xterm/xterm": "^5.5.0",
+    "chokidar": "^4.0.3",
+    "typescript": "^5.9.3",
+    "typescript-language-server": "^5.0.0",
+    "vscode-jsonrpc": "^8.2.1"
+  },
+  "devDependencies": {
+    "@electron/packager": "^18.4.4",
+    "@playwright/test": "^1.56.0",
+    "@types/node": "^24.0.0",
+    "electron": "^42.0.0",
+    "esbuild": "^0.25.0",
+    "tsx": "^4.20.0",
+    "vite": "^7.0.0"
+  }
+}

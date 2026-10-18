@@ -1,0 +1,6 @@
+{
+  "name": "hello-orbit",
+  "private": true,
+  "type": "module",
+  "scripts": { "start": "node main.ts" }
+}

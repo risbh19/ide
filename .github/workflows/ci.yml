@@ -1,0 +1,33 @@
+name: Verify Orbit
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm build
+      - run: pnpm test:app
+      - run: pnpm package
+      - run: pnpm test:package
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Orbit-windows
+          path: release/Orbit-win32-x64/
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: desktop-test-screenshots
+          path: .orbit-test/**/*.png
