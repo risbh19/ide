@@ -54,20 +54,25 @@ function registerIPC() {
   handle('open-file', async () => {
     const result = await dialog.showOpenDialog(win, { title: 'Open file', defaultPath: workspace.root, properties: ['openFile'] });
     if (result.canceled) return null;
-    await workspace.approve(result.filePaths[0]); return workspace.read(result.filePaths[0]);
+    await workspace.approve(result.filePaths[0]); watcher?.add(result.filePaths[0]); return workspace.read(result.filePaths[0]);
   });
   handle('save', input => workspace.save(input));
   handle('save-as', async input => {
     const result = await dialog.showSaveDialog(win, { defaultPath: path.join(workspace.root, path.basename(input.name)), title: 'Save file' });
     if (result.canceled || !result.filePath) return null;
+    const key = (file: string) => process.platform === 'win32' ? path.resolve(file).toLowerCase() : path.resolve(file);
+    if (input.openPaths?.some((file: string) => key(file) === key(result.filePath!))) throw new Error('This file is already open in another tab. Close that tab before saving here.');
     await workspace.approve(result.filePath);
-    return workspace.save({ path: result.filePath, text: input.text, hash: '', eol: 'LF', force: true });
+    watcher?.add(result.filePath);
+    const existing = await workspace.read(result.filePath).catch((error: NodeJS.ErrnoException) => { if (error.code === 'ENOENT') return null; throw error; });
+    return workspace.save({ path: result.filePath, text: input.text, hash: existing?.hash ?? '', eol: input.eol });
   });
   handle('create', input => workspace.create(input.path, input.kind));
   handle('search', (query, sensitive) => workspace.search(query, sensitive));
   handle('git', () => workspace.git());
   handle('language-open', async (file, text) => { await workspace.authorize(file); return language.open(file, text); });
   handle('language-change', async (file, text) => { await workspace.authorize(file); return language.change(file, text); });
+  handle('language-close', async file => { await workspace.authorize(file); return language.close(file); });
   for (const method of ['complete', 'hover', 'definition'] as const) handle(method, async (file, at) => { await workspace.authorize(file); return language[method](file, at); });
   handle('format', async file => { await workspace.authorize(file); return language.format(file); });
   handle('terminal-start', (cols, rows) => {
@@ -86,7 +91,7 @@ function registerIPC() {
     return { id, shell: path.basename(shell) };
   });
   handle('confirm', (message, detail, buttons) => dialog.showMessageBox(win, { message, detail, buttons, type: 'question', cancelId: buttons.length - 1, defaultId: 0, noLink: true }).then(r => r.response));
-  ipcMain.on('terminal-write', (event, id, text) => { if (event.sender === win.webContents && typeof text === 'string') terminals.get(id)?.write(text); });
+  ipcMain.on('terminal-write', (event, id, text) => { if (event.sender === win.webContents && event.senderFrame === win.webContents.mainFrame && typeof text === 'string') terminals.get(id)?.write(text); });
   ipcMain.on('terminal-resize', (event, id, cols, rows) => { if (event.sender === win.webContents && Number.isFinite(cols) && Number.isFinite(rows)) { try { terminals.get(id)?.resize(Math.max(2, Math.min(500, cols)), Math.max(2, Math.min(200, rows))); } catch {} } });
   ipcMain.on('terminal-stop', (event, id) => { if (event.sender === win.webContents) { try { terminals.get(id)?.kill(); } catch {} terminals.delete(id); } });
   ipcMain.on('set-dirty', (event, value) => { if (event.sender === win.webContents) dirty = Boolean(value); });
@@ -118,7 +123,7 @@ app.whenReady().then(async () => {
   registerIPC();
   win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   win.webContents.on('will-navigate', event => event.preventDefault());
-  win.once('ready-to-show', () => { if (!process.env.ORBIT_TEST_DATA) win.show(); });
+  win.once('ready-to-show', () => { if (!process.env.ORBIT_TEST_DATA || process.env.ORBIT_TEST_VISIBLE) win.show(); });
   win.on('close', event => { if (dirty && !allowClose) { event.preventDefault(); emit('command', 'quit'); } });
   win.on('closed', () => { terminals.forEach(t => { try { t.kill(); } catch {} }); terminals.clear(); });
   if (process.env.ORBIT_DEV_URL === 'http://127.0.0.1:5173') await win.loadURL(process.env.ORBIT_DEV_URL);
@@ -129,5 +134,7 @@ let cleanedUp = false;
 app.on('before-quit', event => {
   if (cleanedUp) return;
   event.preventDefault();
+  if (win && !win.isDestroyed()) { win.close(); return; }
+  terminals.forEach(t => { try { t.kill(); } catch {} }); terminals.clear();
   void Promise.allSettled([language?.stop(), watcher?.close()]).finally(() => { cleanedUp = true; app.quit(); });
 });

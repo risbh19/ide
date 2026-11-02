@@ -286,3 +286,4 @@ kbd { font: 10px 'Segoe UI', sans-serif; padding: 2px 5px; border: 1px solid #ff
 .welcome-bottom > span:last-child { margin-left: auto; font-size: 8px; letter-spacing: 1px; }
 @media (max-width: 1100px) { .menu { display: none; } .sidebar { width: 215px; } .command-center { width: 37%; } .status-language { display: none; } .workspace-badge { display: none; } }
 @media (max-height: 760px) { .welcome-content { padding: 20px 0; } .welcome-mark { display: none; } .welcome h1 { font-size: 29px; } .welcome-actions { margin: 17px 0 21px; } .welcome-tips { margin-top: 19px; } .welcome-bottom { margin-top: 20px; } }
+#recovery-warning { padding: 10px 18px; background: #583624; color: #ffe2b6; font-size: 13px; }

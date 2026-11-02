@@ -11,6 +11,7 @@ export class TerminalPanel {
   private unsubscribe: () => void;
   private starting = false;
   private started?: Promise<void>;
+  private generation = 0;
   constructor(private host: HTMLElement, private onShell: (shell: string) => void) {
     this.unsubscribe = window.orbit.onTerminal(event => {
       if (!this.id && this.starting) { this.buffer.push(event); return; }
@@ -26,6 +27,7 @@ export class TerminalPanel {
     this.started = this.initialize(); return this.started;
   }
   private async initialize(): Promise<void> {
+    const generation = ++this.generation;
     this.starting = true;
     this.terminal?.dispose(); this.host.innerHTML = '';
     const terminal = this.terminal = new Terminal({
@@ -36,18 +38,19 @@ export class TerminalPanel {
     this.fit = new FitAddon(); terminal.loadAddon(this.fit); terminal.open(this.host); this.fit.fit();
     try {
       const session = await window.orbit.terminalStart(terminal.cols, terminal.rows);
+      if (generation !== this.generation) { window.orbit.terminalStop(session.id); return; }
       this.id = session.id; this.onShell(session.shell);
       for (const event of this.buffer) if (event.id === this.id && event.data) terminal.write(event.data);
       this.buffer = [];
       terminal.onData(text => { if (this.id) window.orbit.terminalWrite(this.id, text); });
       terminal.onResize(({ cols, rows }) => { if (this.id) window.orbit.terminalResize(this.id, cols, rows); });
-    } catch (error) { terminal.writeln(`Could not start terminal: ${(error as Error).message}`); }
-    finally { this.starting = false; }
+    } catch (error) { if (generation === this.generation) terminal.writeln(`Could not start terminal: ${(error as Error).message}`); }
+    finally { if (generation === this.generation) this.starting = false; }
   }
   resize(): void { if (this.host.clientHeight && this.host.clientWidth) { try { this.fit?.fit(); } catch {} } }
   focus(): void { this.terminal?.focus(); }
   clear(): void { this.terminal?.clear(); }
   async run(command: string): Promise<void> { await this.start(); if (this.id) { window.orbit.terminalWrite(this.id, command + '\r'); this.focus(); } }
-  stop(): void { if (this.id) window.orbit.terminalStop(this.id); this.id = ''; this.terminal?.dispose(); this.terminal = undefined; }
+  stop(): void { this.generation++; this.starting = false; this.buffer = []; if (this.id) window.orbit.terminalStop(this.id); this.id = ''; this.terminal?.dispose(); this.terminal = undefined; }
   dispose(): void { this.stop(); this.observer.disconnect(); this.unsubscribe(); }
 }

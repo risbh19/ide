@@ -33,17 +33,19 @@ class OrbitApp {
   private mode: 'files' | 'search' | 'git' | 'settings' = 'files';
   private panel: 'terminal' | 'problems' = 'terminal';
   private panelVisible = true;
-  private languageTimer?: ReturnType<typeof setTimeout>;
   private persistTimer?: ReturnType<typeof setTimeout>;
   private watcherTimer?: ReturnType<typeof setTimeout>;
   private searchTimer?: ReturnType<typeof setTimeout>;
   private searchTicket = 0;
+  private workspaceTicket = 0;
+  private languageTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private fontSize = Number(localStorage.getItem('orbit-font') ?? 14);
   private paletteKind: 'commands' | 'files' | 'line' = 'commands';
   private paletteRows: { label: string; detail: string; icon: string; run: () => void }[] = [];
   private paletteIndex = 0;
   private gitInfo: Awaited<ReturnType<typeof api.git>> = null;
   private saving = new Map<string, Promise<boolean>>();
+  private closing = new Set<string>();
   private commands = [
     { id: 'open-folder', label: 'Open Folder…', key: 'Ctrl+Shift+O', icon: 'folderOpen' },
     { id: 'open-file', label: 'Open File…', key: 'Ctrl+O', icon: 'files' },
@@ -113,7 +115,7 @@ class OrbitApp {
       const panel = target.closest<HTMLElement>('[data-panel]')?.dataset.panel;
       if (panel) this.showPanel(panel as typeof this.panel);
     });
-    document.addEventListener('keydown', event => this.keydown(event));
+    document.addEventListener('keydown', event => this.keydown(event), { capture: true });
     $('#palette-input').addEventListener('input', () => this.renderPalette());
     $('#palette-input').addEventListener('keydown', event => {
       if (event.key === 'ArrowDown' || event.key === 'ArrowUp') { event.preventDefault(); event.stopPropagation(); this.paletteIndex = (this.paletteIndex + (event.key === 'ArrowDown' ? 1 : -1) + Math.max(1, this.paletteRows.length)) % Math.max(1, this.paletteRows.length); this.drawPalette(); }
@@ -134,9 +136,11 @@ class OrbitApp {
       if (!doc) return;
       if (event.type === 'unlink') { doc.deleted = true; doc.external = true; this.updateChrome(); return; }
       if (event.type === 'change' || event.type === 'add') safely(async () => {
+        const snapshot = doc.snapshot();
         const data = await api.read(event.path);
+        if (!this.docs.includes(doc) || doc.path !== event.path) return;
         if (data.hash === doc.hash) return;
-        if (!doc.dirty) { doc.model.reconcile(data.text, doc.model.selection); doc.saved(data); this.syncViews(doc); await api.languageChange(doc.path, doc.model.text); }
+        if (!doc.dirty && doc.unchanged(snapshot) && !this.saving.has(doc.id)) { doc.model.reconcile(data.text, doc.model.selection); doc.saved(data); this.syncViews(doc); await api.languageChange(doc.path, doc.model.text); }
         else doc.external = true;
         this.updateChrome(); this.persistSoon();
       });
@@ -152,13 +156,14 @@ class OrbitApp {
   }
 
   private keydown(event: KeyboardEvent): void {
+    if (event.isComposing) return;
     const mod = event.ctrlKey || event.metaKey, key = event.key.toLowerCase();
     if (event.key === 'Escape') { this.closePalette(); $('#prompt-backdrop').hidden = true; return; }
     let command = '';
     if (mod && key === 's') command = event.shiftKey ? 'save-as' : 'save';
     if (mod && key === 'n') command = 'new-file';
     if (mod && key === 'o') command = event.shiftKey ? 'open-folder' : 'open-file';
-    if (mod && key === 'p') { event.preventDefault(); this.openPalette(event.shiftKey ? 'commands' : 'files'); return; }
+    if (mod && key === 'p') { event.preventDefault(); event.stopPropagation(); this.openPalette(event.shiftKey ? 'commands' : 'files'); return; }
     if (mod && key === 'k') command = 'palette';
     if (mod && key === 'g') command = 'go-line';
     if (mod && key === '\\') command = 'split';
@@ -170,11 +175,11 @@ class OrbitApp {
     if (event.altKey && event.shiftKey && key === 'f') command = 'format';
     if (event.key === 'F5') command = 'run';
     if (mod && event.key === 'Tab') {
-      event.preventDefault(); if (!this.docs.length) return;
+      event.preventDefault(); event.stopPropagation(); if (!this.docs.length) return;
       const at = this.docs.indexOf(this.active!); this.activate(this.docs[(at + (event.shiftKey ? -1 : 1) + this.docs.length) % this.docs.length]); return;
     }
-    if (mod && (key === '=' || key === '+' || key === '-')) { event.preventDefault(); this.setFont(this.fontSize + (key === '-' ? -1 : 1)); return; }
-    if (command) { event.preventDefault(); safely(() => this.command(command)); }
+    if (mod && (key === '=' || key === '+' || key === '-')) { event.preventDefault(); event.stopPropagation(); this.setFont(this.fontSize + (key === '-' ? -1 : 1)); return; }
+    if (command) { event.preventDefault(); event.stopPropagation(); safely(() => this.command(command)); }
   }
 
   private async command(command: string): Promise<void> {
@@ -231,10 +236,12 @@ class OrbitApp {
   private async chooseFolder(): Promise<void> {
     if (!(await this.confirmUnsaved('Save your changes before switching workspaces?'))) return;
     const next = await api.chooseFolder(); if (!next) return;
-    this.persist(); this.workspace = next; this.docs = []; this.active = undefined;
-    if (this.secondary) this.toggleSplit();
-    this.terminal.stop(); this.directories.clear(); this.expanded.clear(); this.updateWorkspaceLabels();
-    await this.refreshTree(); this.restore();
+    this.persist(); this.workspaceTicket++; this.searchTicket++; clearTimeout(this.searchTimer);
+    for (const timer of this.languageTimers.values()) clearTimeout(timer);
+    this.languageTimers.clear(); this.workspace = next; this.docs = []; this.active = undefined;
+    this.secondary?.dispose(); this.secondary = undefined; this.focused = this.primary; this.primary.clearDocument();
+    this.terminal.stop(); this.gitInfo = null; this.directories.clear(); this.expanded.clear(); this.updateWorkspaceLabels();
+    await this.refreshTree(); this.restore(); this.renderProblems();
     if (!this.docs.length) this.showWelcome();
     void this.refreshGit(); if (this.panelVisible && this.panel === 'terminal') await this.terminal.start();
   }
@@ -242,19 +249,23 @@ class OrbitApp {
     if (!this.docs.some(d => d.dirty)) return true;
     const choice = await api.confirm(message, 'Unsaved files: ' + this.docs.filter(d => d.dirty).map(d => d.name).join(', '), ['Save All', 'Discard Changes', 'Cancel']);
     if (choice === 2) return false;
-    if (choice === 0) return this.saveAll();
+    if (choice === 0) return await this.saveAll() && !this.docs.some(d => d.dirty);
     // Discard is explicit: recovery must not resurrect the discarded buffers.
-    this.docs = this.docs.filter(doc => Boolean(doc.path));
+    this.docs = this.docs.filter(doc => Boolean(doc.path) && !doc.deleted);
     for (const doc of this.docs) if (doc.dirty) { doc.model.reconcile(doc.savedText, [{ anchor: 0, head: 0 }]); doc.eol = doc.savedEol; }
-    this.updateChrome();
+    for (const doc of this.docs) this.syncViews(doc); this.updateChrome();
     return true;
   }
 
   private async refreshTree(): Promise<void> {
-    const root = this.workspace.path;
-    this.directories.set(root, await api.list());
+    const root = this.workspace.path, ticket = this.workspaceTicket;
+    const entries = await api.list();
+    if (ticket !== this.workspaceTicket) return;
+    this.directories.set(root, entries);
     for (const dir of this.expanded) { try { this.directories.set(dir, await api.list(dir)); } catch { this.expanded.delete(dir); } }
-    this.files = await api.files();
+    const files = await api.files();
+    if (ticket !== this.workspaceTicket) return;
+    this.files = files;
     if (this.mode === 'files') this.renderTree();
   }
   private renderTree(): void {
@@ -278,6 +289,7 @@ class OrbitApp {
     $('#sidebar-content').innerHTML = html.join('');
   }
   private setMode(mode: typeof this.mode): void {
+    this.searchTicket++; clearTimeout(this.searchTimer);
     this.mode = mode;
     document.querySelectorAll<HTMLElement>('[data-mode]').forEach(el => el.classList.toggle('active', el.dataset.mode === mode));
     $('#sidebar-title').textContent = { files: 'EXPLORER', search: 'SEARCH', git: 'SOURCE CONTROL', settings: 'PREFERENCES' }[mode];
@@ -305,7 +317,9 @@ class OrbitApp {
     }).join('');
   }
   private async refreshGit(): Promise<void> {
-    this.gitInfo = await api.git();
+    const ticket = this.workspaceTicket, info = await api.git();
+    if (ticket !== this.workspaceTicket) return;
+    this.gitInfo = info;
     $('#status-branch').innerHTML = `${icon('git')}<span>${escapeHTML(this.gitInfo?.branch ?? 'No repository')}</span>`;
     const badge = $<HTMLElement>('.git-count'); badge.hidden = !this.gitInfo?.files.length; badge.textContent = String(this.gitInfo?.files.length ?? 0);
     if (this.mode === 'git') this.renderGit(); else if (this.mode === 'files') this.renderTree();
@@ -326,7 +340,8 @@ class OrbitApp {
     if (!path) { this.showWelcome(); return; }
     const existing = this.docs.find(d => d.path === path);
     if (existing) { this.activate(existing); return; }
-    this.openData(await api.read(path));
+    const ticket = this.workspaceTicket, data = await api.read(path);
+    if (ticket === this.workspaceTicket) this.openData(data);
   }
   private openData(data: FileData): void {
     const existing = this.docs.find(d => d.path === data.path);
@@ -354,10 +369,11 @@ class OrbitApp {
     if (this.mode === 'files') this.renderTree();
   }
   private changed(doc: Document): void {
+    doc.diagnostics = []; this.renderProblems();
     this.syncViews(doc, false);
     this.updateChrome(); this.persistSoon();
-    clearTimeout(this.languageTimer);
-    if (doc.path) this.languageTimer = setTimeout(() => { void api.languageChange(doc.path, doc.model.text).catch(() => {}); }, 240);
+    clearTimeout(this.languageTimers.get(doc.id));
+    if (doc.path) this.languageTimers.set(doc.id, setTimeout(() => { this.languageTimers.delete(doc.id); if (this.docs.includes(doc)) void api.languageChange(doc.path, doc.model.text).catch(() => {}); }, 240));
   }
   private syncViews(doc: Document, sync = true): void {
     for (const view of [this.primary, this.secondary]) if (view?.doc === doc) view.refresh(sync || view !== this.focused);
@@ -369,20 +385,26 @@ class OrbitApp {
     if (this.active !== doc) { this.active = doc; this.updateChrome(); }
   }
   private async save(doc: Document, as = false, force = false): Promise<boolean> {
-    if (this.saving.has(doc.id)) return this.saving.get(doc.id)!;
-    const work = this.performSave(doc, as, force); this.saving.set(doc.id, work);
-    try { return await work; } finally { this.saving.delete(doc.id); }
+    const previous = this.saving.get(doc.id);
+    const work = (async () => { if (previous) await previous.catch(() => false); return this.performSave(doc, as, force); })();
+    this.saving.set(doc.id, work);
+    try { return await work; } finally { if (this.saving.get(doc.id) === work) this.saving.delete(doc.id); }
   }
   private async performSave(doc: Document, as: boolean, force: boolean): Promise<boolean> {
-    const text = doc.model.text;
+    const text = doc.model.text, eol = doc.eol, oldPath = doc.path;
     try {
-      const data = !doc.path || as ? await api.saveAs({ name: doc.name, text }) : await api.save({ path: doc.path, text, hash: doc.hash, eol: doc.eol, force });
+      const data = !doc.path || as ? await api.saveAs({ name: doc.name, text, eol, openPaths: this.docs.filter(other => other !== doc && other.path).map(other => other.path) }) : await api.save({ path: doc.path, text, hash: doc.hash, eol, force });
       if (!data) return false;
-      doc.saved(data, text); this.updateChrome(); this.persistSoon();
+      const duplicate = this.docs.find(other => other !== doc && other.path.toLowerCase() === data.path.toLowerCase());
+      if (duplicate) { duplicate.external = true; }
+      if (oldPath && oldPath !== data.path) void api.languageClose(oldPath).catch(() => {});
+      doc.saved(data, text, true); this.updateChrome(); this.persistSoon();
+      void this.checkSaved(doc, data);
       void api.languageOpen(doc.path, doc.model.text).catch(() => {}); void this.refreshTree(); void this.refreshGit();
       toast(`Saved ${doc.name}`); return true;
     } catch (error) {
       if ((error as Error).message.includes('CONFLICT:')) {
+        if (as || !oldPath) { toast('The Save As target changed on disk. Use Save As again to review the target.', true); return false; }
         doc.external = true; this.updateChrome();
         const choice = await api.confirm('The file changed on disk.', 'Overwrite the disk version with your changes, or cancel to review and reload it.', ['Overwrite', 'Cancel']);
         if (choice === 0) return this.performSave(doc, false, true);
@@ -391,13 +413,30 @@ class OrbitApp {
       throw error;
     }
   }
-  private async saveAll(): Promise<boolean> { for (const doc of this.docs) if (doc.dirty && !(await this.save(doc))) return false; return true; }
+  private async checkSaved(doc: Document, written: FileData): Promise<void> {
+    try {
+      const disk = await api.read(written.path);
+      if (!this.docs.includes(doc) || doc.path !== written.path || doc.hash !== written.hash) return;
+      if (disk.hash !== written.hash) { doc.external = true; this.updateChrome(); this.persistSoon(); }
+    } catch {
+      if (this.docs.includes(doc) && doc.path === written.path && doc.hash === written.hash) { doc.external = true; this.updateChrome(); this.persistSoon(); }
+    }
+  }
+  private async saveAll(): Promise<boolean> { for (const doc of this.docs) if ((doc.dirty || this.saving.has(doc.id)) && !(await this.save(doc))) return false; return !this.docs.some(doc => doc.dirty); }
   private async close(doc: Document): Promise<void> {
+    if (this.closing.has(doc.id)) return;
+    this.closing.add(doc.id);
+    try { await this.performClose(doc); } finally { this.closing.delete(doc.id); }
+  }
+  private async performClose(doc: Document): Promise<void> {
     if (doc.dirty) {
       const choice = await api.confirm(`Save changes to ${doc.name}?`, 'Your edits have not been saved to disk.', ['Save', 'Discard', 'Cancel']);
-      if (choice === 2 || (choice === 0 && !(await this.save(doc)))) return;
+      if (choice === 2 || (choice === 0 && (!(await this.save(doc)) || doc.dirty))) return;
     }
-    const index = this.docs.indexOf(doc); this.docs.splice(index, 1);
+    if (this.saving.has(doc.id)) { await this.saving.get(doc.id); if (doc.dirty) return; }
+    clearTimeout(this.languageTimers.get(doc.id)); this.languageTimers.delete(doc.id);
+    if (doc.path) void api.languageClose(doc.path).catch(() => {});
+    const index = this.docs.indexOf(doc); if (index < 0) return; this.docs.splice(index, 1);
     if (this.secondary?.doc === doc) { this.secondary.dispose(); this.secondary = undefined; this.focused = this.primary; }
     if (this.active === doc || this.primary.doc === doc) {
       const next = this.docs[Math.min(index, this.docs.length - 1)];
@@ -408,7 +447,9 @@ class OrbitApp {
   private async reload(): Promise<void> {
     const doc = this.active; if (!doc?.path) return;
     if (doc.dirty && await api.confirm(`Reload ${doc.name}?`, 'Your unsaved edits will be replaced with the version on disk.', ['Reload', 'Cancel']) !== 0) return;
-    const data = await api.read(doc.path); doc.model.reconcile(data.text, [{ anchor: 0, head: 0 }]); doc.saved(data); this.syncViews(doc); this.updateChrome(); this.persistSoon(); await api.languageChange(doc.path, doc.model.text);
+    const snapshot = doc.snapshot(), data = await api.read(doc.path);
+    if (!this.docs.includes(doc) || !doc.unchanged(snapshot)) { toast('The document changed while reloading. Try again.', true); return; }
+    doc.model.reconcile(data.text, [{ anchor: 0, head: 0 }]); doc.saved(data); this.syncViews(doc); this.updateChrome(); this.persistSoon(); await api.languageChange(doc.path, doc.model.text);
   }
   private async create(kind: 'file' | 'directory'): Promise<void> {
     $('#prompt-title').textContent = kind === 'file' ? 'Create a new file' : 'Create a new folder';
@@ -450,21 +491,25 @@ class OrbitApp {
   }
   private async format(): Promise<void> {
     const doc = this.active; if (!doc?.path) { toast('Save a JavaScript or TypeScript file to format it.'); return; }
+    const snapshot = doc.snapshot();
     await api.languageChange(doc.path, doc.model.text);
     const edits = await api.format(doc.path);
+    if (!this.docs.includes(doc) || !doc.unchanged(snapshot)) { toast('Document changed; formatting was skipped. Run Format again.'); return; }
     if (edits.length) { doc.model.apply(edits, doc.model.selection); this.syncViews(doc); this.changed(doc); toast('Document formatted'); }
     else toast('No formatting changes');
   }
   private async definition(): Promise<void> {
     const doc = this.active; if (!doc?.path) return;
+    const snapshot = doc.snapshot(), at = this.focused.textarea.selectionStart;
     await api.languageChange(doc.path, doc.model.text);
-    const result = await api.definition(doc.path, this.focused.textarea.selectionStart);
+    const result = await api.definition(doc.path, at);
+    if (this.active !== doc || !doc.unchanged(snapshot)) return;
     if (!result) { toast('No definition found here.'); return; }
     await this.open(result.path); this.focused.goTo(result.line, result.column);
   }
   private async run(): Promise<void> {
     const doc = this.active; if (!doc) return;
-    if (doc.dirty || !doc.path) { if (!(await this.save(doc))) return; }
+    if (doc.dirty || !doc.path) { if (!(await this.save(doc)) || doc.dirty) return; }
     const ext = doc.path.split('.').at(-1)?.toLowerCase();
     const runner = /^(ts|js|mjs|cjs)$/.test(ext ?? '') ? 'node' : ext === 'py' ? 'python' : '';
     if (!runner) { toast('Run supports .ts, .js, .mjs, .cjs and .py files. Other tools can run in the terminal.'); return; }
@@ -516,9 +561,13 @@ class OrbitApp {
   private persist(): void {
     if (!this.workspace) return;
     try {
-      const session = { active: this.active?.id, docs: this.docs.map(doc => ({ id: doc.id, path: doc.path, name: doc.name, text: doc.model.text, savedText: doc.savedText, hash: doc.hash, eol: doc.eol, savedEol: doc.savedEol, selection: doc.model.selection, scrollTop: doc.scrollTop })) };
+      const session = { active: this.active?.id, docs: this.docs.map(doc => ({ id: doc.id, path: doc.path, name: doc.name, text: doc.model.text, savedText: doc.savedText, hash: doc.hash, eol: doc.eol, savedEol: doc.savedEol, deleted: doc.deleted, external: doc.external, selection: doc.model.selection, scrollTop: doc.scrollTop })) };
       localStorage.setItem(`orbit-session:${this.workspace.path}`, JSON.stringify(session));
-    } catch { /* Quota limits must never prevent saving to disk. */ }
+      document.body.classList.remove('recovery-failed'); $('#recovery-warning')?.remove();
+    } catch {
+      document.body.classList.add('recovery-failed');
+      if (!$('#recovery-warning')) { const warning = document.createElement('div'); warning.id = 'recovery-warning'; warning.setAttribute('role', 'alert'); warning.textContent = 'Session recovery could not be saved. Save your files to disk before closing.'; $('#editors').before(warning); }
+    }
   }
   private restore(): void {
     try {
@@ -526,18 +575,20 @@ class OrbitApp {
       const session = JSON.parse(raw);
       for (const item of session.docs) {
         const doc = new Document(item.name, item.text);
-        Object.assign(doc, { id: item.id, path: item.path, savedText: item.savedText, hash: item.hash, eol: item.eol, savedEol: item.savedEol ?? item.eol, scrollTop: item.scrollTop });
+        Object.assign(doc, { id: item.id, path: item.path, savedText: item.savedText, hash: item.hash, eol: item.eol, savedEol: item.savedEol ?? item.eol, deleted: Boolean(item.deleted), external: Boolean(item.external), scrollTop: item.scrollTop });
         doc.model.selection = item.selection;
         this.docs.push(doc);
         if (doc.path) {
           void api.languageOpen(doc.path, doc.model.text).catch(() => {});
+          const snapshot = doc.snapshot();
           void api.read(doc.path).then(data => {
+            if (!this.docs.includes(doc)) return;
             if (data.hash !== doc.hash) {
-              if (!doc.dirty) { doc.model.reconcile(data.text, doc.model.selection); doc.saved(data); this.syncViews(doc); }
+              if (!doc.dirty && doc.unchanged(snapshot)) { doc.model.reconcile(data.text, doc.model.selection); doc.saved(data); this.syncViews(doc); void api.languageChange(doc.path, doc.model.text).catch(() => {}); }
               else doc.external = true;
               this.updateChrome();
             }
-          }).catch(() => { doc.deleted = true; doc.external = true; this.updateChrome(); });
+          }).catch(() => { if (this.docs.includes(doc)) { doc.deleted = true; doc.external = true; this.updateChrome(); } });
         }
       }
       const active = this.docs.find(d => d.id === session.active) ?? this.docs[0]; if (active) this.activate(active);

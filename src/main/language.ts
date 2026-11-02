@@ -15,29 +15,41 @@ export class LanguageClient {
   private child?: ChildProcessWithoutNullStreams;
   private connection?: MessageConnection;
   private ready?: Promise<void>;
+  private lifecycle: Promise<void> = Promise.resolve();
+  private generation = 0;
   private root = '';
   private documents = new Map<string, { text: string; version: number }>();
   constructor(private serverPath: string, private emit: (event: string, value: unknown) => void) {}
 
   start(root: string): void {
+    const generation = ++this.generation;
     this.root = root;
-    const stopped = this.stop(); this.documents.clear();
+    this.documents.clear();
     this.emit('language-status', 'Starting TypeScript…');
-    this.ready = stopped.then(() => this.initialize(root)).catch(error => { this.emit('language-status', `Unavailable: ${(error as Error).message}`); throw error; });
+    this.ready = this.lifecycle = this.lifecycle.catch(() => {}).then(async () => {
+      await this.stopCurrent();
+      if (generation !== this.generation) return;
+      await this.initialize(root, generation);
+    }).catch(error => { if (generation === this.generation) this.emit('language-status', `Unavailable: ${(error as Error).message}`); throw error; });
     void this.ready.catch(() => {});
   }
-  private async initialize(root: string): Promise<void> {
+  private async initialize(root: string, generation: number): Promise<void> {
     const child = this.child = spawn(process.execPath, [this.serverPath, '--stdio'], {
       cwd: root, env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }, windowsHide: true,
     });
     child.on('error', error => this.emit('language-status', `Unavailable: ${error.message}`));
     child.stderr.on('data', () => {});
+    child.on('exit', () => { if (generation === this.generation && this.child === child) this.emit('language-status', 'Unavailable: TypeScript server exited. Reopen the workspace to restart.'); });
     const connection = this.connection = createMessageConnection(new StreamMessageReader(child.stdout), new StreamMessageWriter(child.stdin));
-    connection.onNotification('textDocument/publishDiagnostics', (params: { uri: string; diagnostics: { range: Range; message: string; severity?: number }[] }) => {
+    connection.onClose(() => connection.dispose());
+    connection.onNotification('textDocument/publishDiagnostics', (params: { uri: string; version?: number; diagnostics: { range: Range; message: string; severity?: number }[] }) => {
+      if (generation !== this.generation) return;
       let file: string; try { file = fileURLToPath(params.uri); } catch { return; }
       // LSP URI libraries normalize Windows drive casing; keep the editor's original spelling.
       if (process.platform === 'win32') file = [...this.documents.keys()].find(key => key.toLowerCase() === file.toLowerCase()) ?? file;
-      const text = this.documents.get(file)?.text ?? '';
+      const doc = this.documents.get(file);
+      if (!doc || params.version !== undefined && params.version !== doc.version) return;
+      const text = doc.text;
       const diagnostics: Diagnostic[] = params.diagnostics.map(d => ({ path: file, line: d.range.start.line + 1, column: d.range.start.character + 1, start: offset(text, d.range.start), end: offset(text, d.range.end), message: d.message, severity: d.severity ?? 1 }));
       this.emit('diagnostics', diagnostics.length ? diagnostics : [{ path: file, line: 0, column: 0, start: 0, end: 0, message: '', severity: 0 }]);
     });
@@ -52,7 +64,7 @@ export class LanguageClient {
       initializationOptions: { hostInfo: 'Orbit', preferences: { includeCompletionsForModuleExports: false } },
     });
     await connection.sendNotification('initialized', {});
-    this.emit('language-status', 'TypeScript ready');
+    if (generation === this.generation) this.emit('language-status', 'TypeScript ready');
   }
   private async request<T>(method: string, params: unknown): Promise<T> {
     if (!this.connection) throw new Error('Language server is offline.');
@@ -66,40 +78,66 @@ export class LanguageClient {
   }
   async open(file: string, text: string): Promise<void> {
     if (!supported(file)) return;
+    const generation = this.generation;
     await this.ready;
+    if (generation !== this.generation) return;
     if (this.documents.has(file)) { await this.change(file, text); return; }
     this.documents.set(file, { text, version: 1 });
     await this.connection?.sendNotification('textDocument/didOpen', { textDocument: { uri: pathToFileURL(file).href, languageId: /\.tsx$/.test(file) ? 'typescriptreact' : /\.jsx$/.test(file) ? 'javascriptreact' : /\.ts$/.test(file) ? 'typescript' : 'javascript', version: 1, text } });
   }
   async change(file: string, text: string): Promise<void> {
     if (!supported(file)) return;
+    const generation = this.generation;
     await this.ready;
+    if (generation !== this.generation) return;
     const doc = this.documents.get(file);
     if (!doc) { await this.open(file, text); return; }
+    if (doc.text === text) return;
     doc.text = text; doc.version++;
     await this.connection?.sendNotification('textDocument/didChange', { textDocument: { uri: pathToFileURL(file).href, version: doc.version }, contentChanges: [{ text }] });
   }
   private params(file: string, at: number) { return { textDocument: { uri: pathToFileURL(file).href }, position: position(this.documents.get(file)?.text ?? '', at) }; }
+  async close(file: string): Promise<void> {
+    const generation = this.generation;
+    await this.ready;
+    if (generation !== this.generation || !this.documents.delete(file)) return;
+    await this.connection?.sendNotification('textDocument/didClose', { textDocument: { uri: pathToFileURL(file).href } });
+  }
   async complete(file: string, at: number): Promise<Completion[]> {
     if (!supported(file)) return [];
+    const generation = this.generation;
     await this.ready;
-    const text = this.documents.get(file)?.text ?? '';
+    if (generation !== this.generation) return [];
+    const doc = this.documents.get(file), version = doc?.version;
+    if (!doc) return [];
+    const text = doc?.text ?? '';
     const result = await this.request<any>('textDocument/completion', this.params(file, at));
+    if (generation !== this.generation || this.documents.get(file) !== doc || doc?.version !== version) return [];
     const prefix = /[\w$]*$/.exec(text.slice(0, at))![0];
     return (Array.isArray(result) ? result : result?.items ?? []).slice(0, 80).map((item: any) => ({ label: item.label, detail: item.detail, insertText: item.textEdit?.newText ?? item.insertText ?? item.label, start: item.textEdit?.range ? offset(text, item.textEdit.range.start) : at - prefix.length, end: item.textEdit?.range ? offset(text, item.textEdit.range.end) : at }));
   }
   async hover(file: string, at: number): Promise<Hover | null> {
     if (!supported(file)) return null;
+    const generation = this.generation;
     await this.ready;
+    if (generation !== this.generation) return null;
+    const doc = this.documents.get(file), version = doc?.version;
+    if (!doc) return null;
     const result = await this.request<any>('textDocument/hover', this.params(file, at));
+    if (generation !== this.generation || this.documents.get(file) !== doc || doc.version !== version) return null;
     const content = result?.contents;
     if (!content) return null;
     return { text: (Array.isArray(content) ? content : [content]).map(c => typeof c === 'string' ? c : c.value ?? '').join('\n\n') };
   }
   async definition(file: string, at: number): Promise<Definition | null> {
     if (!supported(file)) return null;
+    const generation = this.generation;
     await this.ready;
+    if (generation !== this.generation) return null;
+    const doc = this.documents.get(file), version = doc?.version;
+    if (!doc) return null;
     const result = await this.request<any>('textDocument/definition', this.params(file, at));
+    if (generation !== this.generation || this.documents.get(file) !== doc || doc.version !== version) return null;
     const item = Array.isArray(result) ? result[0] : result;
     if (!item) return null;
     const range = item.targetSelectionRange ?? item.range;
@@ -109,23 +147,32 @@ export class LanguageClient {
   }
   async format(file: string): Promise<TextEdit[]> {
     if (!supported(file)) return [];
+    const generation = this.generation;
     await this.ready;
-    const text = this.documents.get(file)?.text ?? '';
+    if (generation !== this.generation) return [];
+    const doc = this.documents.get(file), version = doc?.version;
+    if (!doc) return [];
+    const text = doc?.text ?? '';
     const result = await this.request<any[]>('textDocument/formatting', { textDocument: { uri: pathToFileURL(file).href }, options: { tabSize: 2, insertSpaces: true } });
+    if (generation !== this.generation || this.documents.get(file) !== doc || doc?.version !== version) return [];
     return (result ?? []).map(edit => ({ start: offset(text, edit.range.start), end: offset(text, edit.range.end), text: edit.newText }));
   }
-  async stop(): Promise<void> {
+  stop(): Promise<void> {
+    this.generation++; this.documents.clear(); this.ready = undefined;
+    return this.lifecycle = this.lifecycle.catch(() => {}).then(() => this.stopCurrent());
+  }
+  private async stopCurrent(): Promise<void> {
     const connection = this.connection, child = this.child;
     this.connection = undefined; this.child = undefined;
     if (!child) return;
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       await Promise.race([
-        connection?.sendRequest('shutdown').catch(() => {}),
+        Promise.resolve().then(() => connection?.sendRequest('shutdown')).catch(() => {}),
         new Promise(resolve => timer = setTimeout(resolve, 1200)),
       ]);
       clearTimeout(timer);
-      await connection?.sendNotification('exit').catch(() => {});
+      await Promise.resolve().then(() => connection?.sendNotification('exit')).catch(() => {});
       child.stdin.end();
       if (child.exitCode === null) await Promise.race([
         new Promise(resolve => child.once('exit', resolve)),

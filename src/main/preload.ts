@@ -20,6 +20,7 @@ const api: OrbitAPI = {
   git: () => ipcRenderer.invoke('git'),
   languageOpen: (path, text) => ipcRenderer.invoke('language-open', path, text),
   languageChange: (path, text) => ipcRenderer.invoke('language-change', path, text),
+  languageClose: path => ipcRenderer.invoke('language-close', path),
   complete: (path, offset) => ipcRenderer.invoke('complete', path, offset),
   hover: (path, offset) => ipcRenderer.invoke('hover', path, offset),
   definition: (path, offset) => ipcRenderer.invoke('definition', path, offset),

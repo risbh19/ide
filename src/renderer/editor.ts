@@ -28,6 +28,9 @@ export class EditorView {
   private completions: Completion[] = [];
   private selectedCompletion = 0;
   private completionTicket = 0;
+  private completionVersion = -1;
+  private completionSelection = { start: 0, end: 0 };
+  private inputHint?: { selection: Selection; type: string; version: number };
   private lineHeight = 24;
   private charWidth = 8.43;
   private fontSize = 14;
@@ -66,7 +69,7 @@ export class EditorView {
     });
     this.textarea.addEventListener('focus', () => { this.callbacks.focus(this); this.element.classList.add('focused'); });
     this.textarea.addEventListener('blur', () => { this.element.classList.remove('focused'); this.tooltip.hidden = true; });
-    this.textarea.addEventListener('compositionstart', () => { this.composing = true; this.hideCompletion(); });
+    this.textarea.addEventListener('compositionstart', () => { this.composing = true; this.inputHint = undefined; if (this.doc) this.doc.model.selection = [this.nativeSelection()]; this.hideCompletion(); });
     this.textarea.addEventListener('compositionend', () => { this.composing = false; this.input(); });
     this.textarea.addEventListener('paste', event => {
       if ((this.doc?.model.selection.length ?? 0) > 1) { event.preventDefault(); this.insert(event.clipboardData?.getData('text/plain').replace(/\r\n/g, '\n') ?? ''); }
@@ -98,6 +101,7 @@ export class EditorView {
     this.measure(); this.render();
   }
   setDocument(doc: Document): void {
+    if (this.composing) { this.composing = false; this.input(); }
     this.doc = doc; this.textarea.value = doc.model.text;
     this.highlighted = doc.tokenizer.tokenize(doc.model.text, languageFor(doc.name));
     const selection = doc.model.selection.at(-1)!;
@@ -107,6 +111,7 @@ export class EditorView {
   }
   refresh(sync = true): void {
     if (!this.doc) return;
+    if (this.completionVersion !== this.doc.model.version) this.hideCompletion();
     if (sync) {
       const top = this.textarea.scrollTop, left = this.textarea.scrollLeft;
       this.textarea.value = this.doc.model.text;
@@ -117,10 +122,15 @@ export class EditorView {
     this.highlighted = this.doc.tokenizer.tokenize(this.doc.model.text, languageFor(this.doc.name));
     this.render(); this.updateFindCount();
   }
+  clearDocument(): void {
+    this.doc = undefined; this.textarea.value = ''; this.highlighted = []; this.completions = []; this.inputHint = undefined;
+    this.code.innerHTML = ''; this.gutter.innerHTML = ''; this.decorations.innerHTML = ''; this.hideCompletion(); this.tooltip.hidden = true;
+  }
   private nativeSelection(): Selection {
     return this.textarea.selectionDirection === 'backward' ? { anchor: this.textarea.selectionEnd, head: this.textarea.selectionStart } : { anchor: this.textarea.selectionStart, head: this.textarea.selectionEnd };
   }
   private selection(): void {
+    if (!this.completion.hidden && (this.textarea.selectionStart !== this.completionSelection.start || this.textarea.selectionEnd !== this.completionSelection.end)) this.hideCompletion();
     cancelAnimationFrame(this.selectionFrame);
     this.selectionFrame = requestAnimationFrame(() => {
       if (!this.doc || document.activeElement !== this.textarea) return;
@@ -130,13 +140,16 @@ export class EditorView {
   }
   private input(): void {
     if (!this.doc || this.composing) return;
-    this.doc.model.reconcile(this.textarea.value.replace(/\r\n/g, '\n'), [this.nativeSelection()]);
+    const hint = this.inputHint?.version === this.doc.model.version ? this.inputHint : undefined; this.inputHint = undefined;
+    this.doc.model.reconcile(this.textarea.value, [this.nativeSelection()], hint);
     this.refresh(false); this.callbacks.change(this.doc); this.callbacks.cursor(this.doc);
     const prefix = this.doc.model.text.slice(0, this.textarea.selectionStart);
     if (/[\w$.]$/.test(prefix)) void this.showCompletions(); else this.hideCompletion();
   }
   private beforeInput(event: InputEvent): void {
-    if (!this.doc || this.composing || this.doc.model.selection.length < 2) return;
+    this.inputHint = undefined;
+    if (!this.doc || this.composing) return;
+    if (this.doc.model.selection.length < 2) { const selection = this.nativeSelection(); this.doc.model.selection = [selection]; this.inputHint = { selection, type: event.inputType, version: this.doc.model.version }; return; }
     if (event.inputType === 'insertText' && event.data) { event.preventDefault(); this.insert(event.data); }
     if (event.inputType === 'deleteContentBackward' || event.inputType === 'deleteContentForward') { event.preventDefault(); this.insert('', event.inputType === 'deleteContentBackward' ? -1 : 1); }
   }
@@ -146,7 +159,11 @@ export class EditorView {
     const edits: Edit[] = []; const next: Selection[] = []; let delta = 0;
     for (const s of selections) {
       let start = Math.min(s.anchor, s.head), end = Math.max(s.anchor, s.head);
-      if (start === end && deletion) { if (deletion < 0) start = Math.max(0, start - 1); else end = Math.min(this.doc.model.length, end + 1); }
+      if (start === end && deletion) {
+        const text = this.doc.model.text;
+        if (deletion < 0) { start = Math.max(0, start - 1); if (start > 0 && /[\uDC00-\uDFFF]/.test(text[start]) && /[\uD800-\uDBFF]/.test(text[start - 1])) start--; }
+        else { end = Math.min(text.length, end + 1); if (end < text.length && /[\uD800-\uDBFF]/.test(text[end - 1]) && /[\uDC00-\uDFFF]/.test(text[end])) end++; }
+      }
       if (edits.length && start < edits.at(-1)!.end) continue;
       edits.push({ start, end, text });
       const head = start + delta + text.length; next.push({ anchor: head, head }); delta += text.length - (end - start);
@@ -164,6 +181,7 @@ export class EditorView {
       else { this.selectedCompletion = (this.selectedCompletion + (event.key === 'ArrowDown' ? 1 : -1) + this.completions.length) % this.completions.length; this.renderCompletions(); }
       return;
     }
+    if (['ArrowLeft', 'ArrowRight', 'Home', 'End', 'PageUp', 'PageDown'].includes(event.key)) { this.hideCompletion(); this.tooltip.hidden = true; }
     if (mod && event.key.toLowerCase() === 'z') { event.preventDefault(); event.shiftKey ? this.doc.model.redo() : this.doc.model.undo(); this.changed(); return; }
     if (mod && event.key.toLowerCase() === 'y') { event.preventDefault(); this.doc.model.redo(); this.changed(); return; }
     if (mod && !event.shiftKey && event.key.toLowerCase() === 'f') { event.preventDefault(); this.openFind(); return; }
@@ -278,17 +296,17 @@ export class EditorView {
   }
   private caretPoint(): { x: number; y: number } {
     const p = this.doc!.model.position(this.textarea.selectionEnd);
-    const row = this.doc!.model.text.split('\n')[p.line - 1].slice(0, p.column - 1).replace(/\t/g, '  ');
+    const row = this.doc!.model.lineText(p.line).slice(0, p.column - 1).replace(/\t/g, '  ');
     return { x: 90 + row.length * this.charWidth - this.textarea.scrollLeft, y: 18 + p.line * this.lineHeight - this.textarea.scrollTop };
   }
   async showCompletions(): Promise<void> {
     if (!this.doc?.path || this.doc.model.selection.length > 1) return;
-    const ticket = ++this.completionTicket, doc = this.doc, at = this.textarea.selectionStart, version = doc.model.version;
+    const ticket = ++this.completionTicket, doc = this.doc, at = this.textarea.selectionStart, end = this.textarea.selectionEnd, version = doc.model.version;
     try {
       await window.orbit.languageChange(doc.path, doc.model.text);
       const items = await window.orbit.complete(doc.path, at);
-      if (ticket !== this.completionTicket || this.doc !== doc || doc.model.version !== version || document.activeElement !== this.textarea) return;
-      this.completions = items; this.selectedCompletion = 0;
+      if (ticket !== this.completionTicket || this.doc !== doc || doc.model.version !== version || this.textarea.selectionStart !== at || this.textarea.selectionEnd !== end || document.activeElement !== this.textarea) return;
+      this.completions = items; this.completionVersion = version; this.completionSelection = { start: at, end }; this.selectedCompletion = 0;
       if (items.length) { this.completion.hidden = false; this.renderCompletions(); } else this.hideCompletion();
     } catch { this.hideCompletion(); }
   }
@@ -300,18 +318,18 @@ export class EditorView {
     this.completion.querySelector('.selected')?.scrollIntoView({ block: 'nearest' });
   }
   private acceptCompletion(index: number): void {
-    const item = this.completions[index]; if (!item || !this.doc) return;
+    const item = this.completions[index]; if (!item || !this.doc || this.doc.model.version !== this.completionVersion || this.textarea.selectionStart !== this.completionSelection.start || this.textarea.selectionEnd !== this.completionSelection.end) { this.hideCompletion(); return; }
     this.doc.model.apply([{ start: item.start, end: item.end, text: item.insertText }], [{ anchor: item.start + item.insertText.length, head: item.start + item.insertText.length }]);
     this.hideCompletion(); this.changed(); this.textarea.focus();
   }
   private hideCompletion(): void { this.completionTicket++; this.completion.hidden = true; }
   async showHover(): Promise<void> {
     if (!this.doc?.path) return;
-    const doc = this.doc;
+    const doc = this.doc, snapshot = doc.snapshot(), at = this.textarea.selectionStart;
     try {
       await window.orbit.languageChange(doc.path, doc.model.text);
-      const result = await window.orbit.hover(doc.path, this.textarea.selectionStart);
-      if (!result || this.doc !== doc) return;
+      const result = await window.orbit.hover(doc.path, at);
+      if (!result || this.doc !== doc || !doc.unchanged(snapshot) || this.textarea.selectionStart !== at || document.activeElement !== this.textarea) return;
       const point = this.caretPoint();
       this.tooltip.textContent = result.text; this.tooltip.hidden = false;
       this.tooltip.style.left = `${Math.max(70, Math.min(point.x, this.element.clientWidth - 420))}px`;
@@ -333,14 +351,14 @@ export class EditorView {
     this.code.innerHTML = code.join(''); this.gutter.innerHTML = gutter.join('');
     const highlight = this.element.querySelector<HTMLElement>('.line-highlight')!;
     highlight.style.top = `${18 + (active - 1) * this.lineHeight - top}px`; highlight.style.height = `${this.lineHeight}px`;
-    const rows = this.doc.model.text.split('\n');
     const rect = (a: number, b: number, cls: string) => {
       const p = this.doc!.model.position(a), q = this.doc!.model.position(b);
       for (let line = p.line; line <= q.line; line++) {
         if (line - 1 < start || line - 1 >= end) continue;
-        const c1 = line === p.line ? p.column - 1 : 0, c2 = line === q.line ? q.column - 1 : rows[line - 1].length;
-        const x = rows[line - 1].slice(0, c1).replace(/\t/g, '  ').length * this.charWidth;
-        const width = rows[line - 1].slice(c1, c2).replace(/\t/g, '  ').length * this.charWidth;
+        const row = this.doc!.model.lineText(line);
+        const c1 = line === p.line ? p.column - 1 : 0, c2 = line === q.line ? q.column - 1 : row.length;
+        const x = row.slice(0, c1).replace(/\t/g, '  ').length * this.charWidth;
+        const width = row.slice(c1, c2).replace(/\t/g, '  ').length * this.charWidth;
         decorations.push(`<div class="${cls}" style="left:${90 + x - left}px;top:${18 + (line - 1) * this.lineHeight - top}px;width:${Math.max(cls === 'extra-caret' ? 2 : 4, width)}px;height:${this.lineHeight}px"></div>`);
       }
     };

@@ -13,6 +13,7 @@ const inside = (root: string, target: string) => { const relative = path.relativ
 export class WorkspaceFS {
   root = '';
   private approved = new Set<string>();
+  private saves = new Map<string, Promise<FileData>>();
   async setRoot(root: string): Promise<void> {
     const real = await fs.realpath(root);
     if (!(await fs.stat(real)).isDirectory()) throw new Error('Choose a directory.');
@@ -59,7 +60,7 @@ export class WorkspaceFS {
   }
   async read(file: string): Promise<FileData> {
     const safe = await this.authorize(file);
-    if ((await fs.stat(safe)).size > 5 * 1024 * 1024) throw new Error('This editor supports text files up to 5 MB.');
+    if ((await fs.stat(safe)).size > 1024 * 1024) throw new Error('This editor supports UTF-8 text files up to 1 MiB. Larger files exceed the verified desktop performance limit.');
     const bytes = await fs.readFile(safe);
     if (bytes.includes(0)) throw new Error('Binary files cannot be opened in the text editor.');
     try { new TextDecoder('utf-8', { fatal: true }).decode(bytes); } catch { throw new Error('This file is not valid UTF-8 text.'); }
@@ -67,6 +68,13 @@ export class WorkspaceFS {
     return { path: safe, text: raw.replace(/\r\n/g, '\n'), hash: hash(bytes), eol: raw.includes('\r\n') ? 'CRLF' : 'LF' };
   }
   async save(input: { path: string; text: string; hash: string; eol: 'LF' | 'CRLF'; force?: boolean }): Promise<FileData> {
+    const key = process.platform === 'win32' ? path.resolve(input.path).toLowerCase() : path.resolve(input.path);
+    const previous = this.saves.get(key);
+    const work = (async () => { if (previous) await previous.catch(() => {}); return this.write(input); })();
+    this.saves.set(key, work);
+    try { return await work; } finally { if (this.saves.get(key) === work) this.saves.delete(key); }
+  }
+  private async write(input: { path: string; text: string; hash: string; eol: 'LF' | 'CRLF'; force?: boolean }): Promise<FileData> {
     const safe = await this.authorize(input.path);
     let existing: Buffer | null = null;
     try { existing = await fs.readFile(safe); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
@@ -76,6 +84,11 @@ export class WorkspaceFS {
     try {
       const mode = existing ? (await fs.stat(safe)).mode : undefined;
       await fs.writeFile(temporary, raw, { encoding: 'utf8', flag: 'wx', mode });
+      // Recheck after writing the temporary file: an external writer may have raced the first read.
+      if (!input.force) {
+        const latest = await fs.readFile(safe).catch((error: NodeJS.ErrnoException) => { if (error.code === 'ENOENT') return null; throw error; });
+        if (latest ? hash(latest) !== input.hash : Boolean(input.hash)) throw new Error('CONFLICT: The file changed on disk.');
+      }
       await fs.rename(temporary, safe);
     } finally { await fs.rm(temporary, { force: true }).catch(() => {}); }
     return { path: safe, text: input.text, hash: hash(raw), eol: input.eol };

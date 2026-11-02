@@ -38,6 +38,16 @@ try {
   await expect.poll(() => fs.readFile(path.join(workspace, 'smoke.ts'), 'utf8')).toContain('projectName');
   console.log('PASS: create, edit, and atomic save');
 
+  await editor.press('Control+f');
+  await page.getByRole('textbox', { name: 'Find in file', exact: true }).fill('projectName');
+  await page.getByRole('textbox', { name: 'Replace with', exact: true }).fill('projectLabel');
+  await page.getByRole('button', { name: 'All', exact: true }).click();
+  await expect(editor).toHaveValue("const projectLabel: string = 'Orbit';\nconsole.log(projectLabel);\n");
+  await page.getByRole('button', { name: 'Close find', exact: true }).click();
+  await editor.press('Control+z');
+  await expect(editor).toHaveValue("const projectName: string = 'Orbit';\nconsole.log(projectName);\n");
+  console.log('PASS: find/replace is a single reversible transaction');
+
   await editor.press('Control+Home');
   await editor.press('Control+f');
   await page.getByRole('textbox', { name: 'Find in file', exact: true }).fill('projectName');
@@ -100,13 +110,14 @@ try {
       const off = window.orbit.onTerminal(event => {
         if (event.id !== session.id) return;
         data += event.data ?? '';
-        if (data.includes('ORBIT_EXECUTED')) { clearTimeout(timer); off(); window.orbit.terminalStop(session.id); resolve(true); }
+        if (data.includes('ORBIT_EXECUTED_120')) { clearTimeout(timer); off(); window.orbit.terminalStop(session.id); resolve(true); }
       });
-      window.orbit.terminalWrite(session.id, "Write-Output ('ORBIT_' + 'EXECUTED')\r");
+      window.orbit.terminalResize(session.id, 120, 20);
+      window.orbit.terminalWrite(session.id, "Write-Output ('ORBIT_' + 'EXECUTED_' + $Host.UI.RawUI.WindowSize.Width)\r");
     });
   });
   expect(terminalResult).toBe(true);
-  console.log('PASS: ConPTY executes PowerShell commands');
+  console.log('PASS: ConPTY resizes and executes PowerShell commands');
 
   await editor.press('Control+p');
   await page.locator('#palette-input').fill('main.ts');

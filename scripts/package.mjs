@@ -2,6 +2,8 @@ import packager from '@electron/packager';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createRequire } from 'node:module';
+import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import './build.mjs';
 
 // Materialize production dependencies instead of asking a hoist-only pruner to walk pnpm links.
@@ -11,8 +13,12 @@ if (path.dirname(stage) !== project) throw new Error('Packaging directory must b
 await fs.rm(stage, { recursive: true, force: true });
 await fs.mkdir(stage, { recursive: true });
 const manifest = JSON.parse(await fs.readFile('package.json', 'utf8'));
+const sourceCommit = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8', windowsHide: true }).trim();
+const dirty = Boolean(execFileSync('git', ['status', '--porcelain'], { encoding: 'utf8', windowsHide: true }).trim());
+const buildInfo = { version: manifest.version, sourceCommit, dirty, node: process.version, platform: process.platform, arch: process.arch, lockfileSha256: createHash('sha256').update(await fs.readFile('pnpm-lock.yaml')).digest('hex') };
+await fs.writeFile(path.join(stage, 'build-info.json'), JSON.stringify(buildInfo, null, 2));
 await fs.writeFile(path.join(stage, 'package.json'), JSON.stringify({ ...manifest, scripts: undefined, devDependencies: undefined }, null, 2));
-for (const name of ['dist', 'starter', 'README.md']) await fs.cp(name, path.join(stage, name), { recursive: true });
+for (const name of ['dist', 'starter', 'README.md', 'CHANGELOG.md', 'docs']) await fs.cp(name, path.join(stage, name), { recursive: true });
 const copied = new Set();
 async function copyDependency(name, from, modules, optional = false) {
   const resolver = createRequire(path.join(from, 'package.json'));

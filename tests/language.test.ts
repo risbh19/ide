@@ -26,3 +26,30 @@ test('real LSP emits diagnostics using the original Windows document path', { ti
     assert.ok(items.some(item => item.label === 'toUpperCase'));
   } finally { await client.stop(); await fs.rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
 });
+
+test('rapid LSP restarts, close/reopen and shutdown use only the current workspace', { timeout: 35000 }, async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'orbit-lsp-lifecycle-'));
+  const other = path.join(root, 'other'); await fs.mkdir(other);
+  const file = path.join(other, 'current.ts'); await fs.writeFile(file, 'let amount = 1;\namount.');
+  const events: Diagnostic[][] = [];
+  const client = new LanguageClient(path.resolve('node_modules/typescript-language-server/lib/cli.mjs'), (event, value) => { if (event === 'diagnostics') events.push(value as Diagnostic[]); });
+  try {
+    client.start(root); const obsolete = client.open(path.join(root, 'old.ts'), "const bad: number = 'wrong';");
+    client.start(root); client.start(other); await obsolete;
+    await client.open(file, 'let amount = 1;\namount.');
+    assert.ok((await client.complete(file, 'let amount = 1;\namount.'.length)).some(item => item.label === 'toFixed'));
+    await client.close(file); await client.open(file, "let amount = 'hello';\namount.");
+    assert.ok((await client.complete(file, "let amount = 'hello';\namount.".length)).some(item => item.label === 'toUpperCase'));
+    assert.ok(events.every(items => items.every(item => item.path === file)));
+    await client.stop(); await client.stop();
+  } finally { await client.stop(); await fs.rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
+});
+
+test('a missing real language server reports failure and remains stoppable', { timeout: 20000 }, async () => {
+  const statuses: string[] = [];
+  const client = new LanguageClient(path.resolve('missing-language-server.mjs'), (event, value) => { if (event === 'language-status') statuses.push(String(value)); });
+  try {
+    client.start(process.cwd()); await assert.rejects(client.open(path.resolve('missing.ts'), 'let value = 1;'));
+    assert.ok(statuses.some(status => status.startsWith('Unavailable:')));
+  } finally { await client.stop(); }
+});

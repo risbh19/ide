@@ -1,7 +1,7 @@
 export interface Piece { source: 0 | 1; start: number; length: number }
 export interface Selection { anchor: number; head: number }
 export interface Edit { start: number; end: number; text: string }
-interface History { pieces: Piece[]; selection: Selection[] }
+interface History { pieces: Piece[]; selection: Selection[]; cost: number }
 
 /** Immutable original buffer + append-only additions. History shares both buffers. */
 export class PieceTable {
@@ -12,6 +12,7 @@ export class PieceTable {
   private future: History[] = [];
   private cached: string | undefined;
   private starts: number[] | undefined;
+  private compactAt = 8 * 1024 * 1024;
   selection: Selection[] = [{ anchor: 0, head: 0 }];
   version = 0;
 
@@ -23,6 +24,8 @@ export class PieceTable {
     return this.cached ??= this.pieces.map(p => (p.source ? this.additions : this.original).slice(p.start, p.start + p.length)).join('');
   }
   get length(): number { return this.pieces.reduce((n, p) => n + p.length, 0); }
+  lineText(line: number): string { return this.text.slice(this.lineStarts[line - 1] ?? this.length, (this.lineStarts[line] ?? this.length + 1) - 1); }
+  statistics() { return { pieces: this.pieces.length, additions: this.additions.length, undo: this.past.length, redo: this.future.length }; }
   get lineStarts(): number[] {
     if (!this.starts) {
       this.starts = [0];
@@ -41,9 +44,24 @@ export class PieceTable {
     const row = Math.max(0, Math.min(line - 1, this.lineStarts.length - 1));
     return Math.min(this.lineStarts[row] + Math.max(0, column - 1), (this.lineStarts[row + 1] ?? this.length + 1) - 1);
   }
-  private snapshot(): History { return { pieces: this.pieces.map(p => ({ ...p })), selection: this.selection.map(s => ({ ...s })) }; }
+  private snapshot(cost = 0): History { return { pieces: this.pieces.map(p => ({ ...p })), selection: this.selection.map(s => ({ ...s })), cost }; }
   private restore(state: History): void { this.pieces = state.pieces; this.selection = state.selection; this.invalidate(); }
   private invalidate(): void { this.cached = undefined; this.starts = undefined; this.version++; }
+  private compact(): void {
+    if (this.additions.length < this.compactAt) return;
+    const all = [this.pieces, ...this.past.map(s => s.pieces), ...this.future.map(s => s.pieces)];
+    const ranges = all.flat().filter(p => p.source === 1).map(p => ({ start: p.start, end: p.start + p.length, target: 0 })).sort((a, b) => a.start - b.start);
+    const merged: typeof ranges = [];
+    for (const range of ranges) { const last = merged.at(-1); if (last && range.start <= last.end) last.end = Math.max(last.end, range.end); else merged.push({ ...range }); }
+    let size = 0;
+    const chunks = merged.map(range => { range.target = size; size += range.end - range.start; return this.additions.slice(range.start, range.end); });
+    for (const pieces of all) for (const piece of pieces) if (piece.source === 1) {
+      let low = 0, high = merged.length;
+      while (low + 1 < high) { const mid = (low + high) >>> 1; if (merged[mid].start <= piece.start) low = mid; else high = mid; }
+      piece.start = merged[low].target + piece.start - merged[low].start;
+    }
+    this.additions = chunks.join(''); this.compactAt = this.additions.length + 8 * 1024 * 1024;
+  }
   private range(start: number, end: number): Piece[] {
     const result: Piece[] = [];
     let offset = 0;
@@ -63,8 +81,20 @@ export class PieceTable {
       if (edit.start < 0 || edit.end > this.length || edit.end < edit.start || edit.start < lastEnd) throw new RangeError('Edits must be in bounds and may not overlap.');
       lastEnd = edit.end;
     }
-    this.past.push(this.snapshot());
-    if (this.past.length > 500) this.past.shift();
+    let nextStarts: number[] | undefined;
+    if (this.starts) {
+      nextStarts = []; let index = 0, delta = 0;
+      for (const edit of sorted) {
+        while (index < this.starts.length && this.starts[index] <= edit.start) nextStarts.push(this.starts[index++] + delta);
+        while (index < this.starts.length && this.starts[index] <= edit.end) index++;
+        for (let i = 0; i < edit.text.length; i++) if (edit.text.charCodeAt(i) === 10) nextStarts.push(edit.start + delta + i + 1);
+        delta += edit.text.length - (edit.end - edit.start);
+      }
+      while (index < this.starts.length) nextStarts.push(this.starts[index++] + delta);
+    }
+    this.past.push(this.snapshot(sorted.reduce((cost, edit) => cost + edit.text.length + edit.end - edit.start, 0)));
+    let bytes = this.past.reduce((n, s) => n + s.cost * 2, 0), count = this.past.reduce((n, s) => n + s.pieces.length, 0);
+    while (this.past.length > 1 && (this.past.length > 500 || bytes > 32 * 1024 * 1024 || count > 100000)) { const old = this.past.shift()!; bytes -= old.cost * 2; count -= old.pieces.length; }
     this.future = [];
     const next: Piece[] = [];
     let cursor = 0;
@@ -82,11 +112,23 @@ export class PieceTable {
     }
     if (selection) this.selection = selection.map(s => ({ anchor: Math.max(0, Math.min(s.anchor, this.length)), head: Math.max(0, Math.min(s.head, this.length)) }));
     this.invalidate();
+    this.starts = nextStarts;
+    this.compact();
   }
   /** Convert a native input/IME transaction into the smallest contiguous edit. */
-  reconcile(text: string, selection: Selection[]): void {
+  reconcile(text: string, selection: Selection[], hint?: { selection: Selection; type: string }): void {
     const before = this.text;
     if (before === text) { this.selection = selection; return; }
+    if (hint) {
+      let start = Math.min(hint.selection.anchor, hint.selection.head), end = Math.max(hint.selection.anchor, hint.selection.head);
+      const delta = text.length - before.length;
+      if (hint.type === 'deleteContentBackward' && start === end && delta < 0) start = Math.max(0, start + delta);
+      else if (hint.type === 'deleteContentForward' && start === end && delta < 0) end = Math.min(before.length, end - delta);
+      if (hint.type === 'insertText' || hint.type === 'insertFromPaste' || hint.type === 'deleteContentBackward' || hint.type === 'deleteContentForward' || hint.type === 'deleteByCut') {
+        const added = delta + end - start;
+        if (added >= 0) { this.apply([{ start, end, text: text.slice(start, start + added) }], selection); return; }
+      }
+    }
     let start = 0, a = before.length, b = text.length;
     while (start < a && start < b && before[start] === text[start]) start++;
     while (a > start && b > start && before[a - 1] === text[b - 1]) { a--; b--; }
@@ -95,11 +137,11 @@ export class PieceTable {
   undo(): boolean {
     const previous = this.past.pop();
     if (!previous) return false;
-    this.future.push(this.snapshot()); this.restore(previous); return true;
+    this.future.push(this.snapshot(previous.cost)); this.restore(previous); return true;
   }
   redo(): boolean {
     const next = this.future.pop();
     if (!next) return false;
-    this.past.push(this.snapshot()); this.restore(next); return true;
+    this.past.push(this.snapshot(next.cost)); this.restore(next); return true;
   }
 }

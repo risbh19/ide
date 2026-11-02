@@ -2,7 +2,7 @@ export interface FileEntry { name: string; path: string; kind: 'file' | 'directo
 export interface FileData { path: string; text: string; hash: string; eol: 'LF' | 'CRLF' }
 export interface Workspace { path: string; name: string; recent: string[] }
 export interface SearchHit { path: string; line: number; column: number; text: string }
-export interface Diagnostic { path: string; line: number; column: number; message: string; severity: number; start: number; end: number }
+export interface Diagnostic { path: string; line: number; column: number; message: string; severity: number; start: number; end: number; version?: number }
 export interface Completion { label: string; detail?: string; insertText: string; start: number; end: number }
 export interface Definition { path: string; line: number; column: number }
 export interface Hover { text: string }
@@ -16,12 +16,13 @@ export interface OrbitAPI {
   read(path: string): Promise<FileData>;
   openFile(): Promise<FileData | null>;
   save(input: { path: string; text: string; hash: string; eol: 'LF' | 'CRLF'; force?: boolean }): Promise<FileData>;
-  saveAs(input: { name: string; text: string }): Promise<FileData | null>;
+  saveAs(input: { name: string; text: string; eol: 'LF' | 'CRLF'; openPaths?: string[] }): Promise<FileData | null>;
   create(input: { path: string; kind: 'file' | 'directory' }): Promise<string>;
   search(query: string, caseSensitive: boolean): Promise<{ hits: SearchHit[]; truncated: boolean }>;
   git(): Promise<{ branch: string; files: { path: string; status: string }[] } | null>;
   languageOpen(path: string, text: string): Promise<void>;
   languageChange(path: string, text: string): Promise<void>;
+  languageClose(path: string): Promise<void>;
   complete(path: string, offset: number): Promise<Completion[]>;
   hover(path: string, offset: number): Promise<Hover | null>;
   definition(path: string, offset: number): Promise<Definition | null>;
