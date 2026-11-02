@@ -3,6 +3,7 @@ import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { setTimeout as delay } from 'node:timers/promises';
 import type { FileData, FileEntry, SearchHit } from '../shared/types';
 
 const exec = promisify(execFile);
@@ -88,12 +89,18 @@ export class WorkspaceFS {
     try {
       const mode = existing ? (await fs.stat(safe)).mode : undefined;
       await fs.writeFile(temporary, raw, { encoding: 'utf8', flag: 'wx', mode });
-      // Recheck after writing the temporary file: an external writer may have raced the first read.
-      if (!input.force) {
-        const latest = await fs.readFile(safe).catch((error: NodeJS.ErrnoException) => { if (error.code === 'ENOENT') return null; throw error; });
-        if (latest ? hash(latest) !== input.hash : Boolean(input.hash)) throw new Error('CONFLICT: The file changed on disk.');
+      for (let attempt = 0; ; attempt++) {
+        // Recheck on every attempt; a writer can change the target while Windows holds a sharing lock.
+        if (!input.force) {
+          const latest = await fs.readFile(safe).catch((error: NodeJS.ErrnoException) => { if (error.code === 'ENOENT') return null; throw error; });
+          if (latest ? hash(latest) !== input.hash : Boolean(input.hash)) throw new Error('CONFLICT: The file changed on disk.');
+        }
+        try { await fs.rename(temporary, safe); break; }
+        catch (error) {
+          if (process.platform !== 'win32' || attempt >= 6 || !['EPERM', 'EACCES', 'EBUSY'].includes((error as NodeJS.ErrnoException).code ?? '')) throw error;
+          await delay(25 * 2 ** attempt);
+        }
       }
-      await fs.rename(temporary, safe);
     } finally { await fs.rm(temporary, { force: true }).catch(() => {}); }
     return { path: safe, text: input.text, hash: hash(raw), eol: input.eol };
   }

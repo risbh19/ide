@@ -8,6 +8,7 @@
 - Kept dirty buffers open when typing continues during Save-and-close; protected deleted files and guarded repeated close requests.
 - Protected external reload/recovery reads from newer edits and watched explicitly opened/saved files.
 - Canonicalized workspace path aliases before containment checks and save queuing, including Windows runner short paths, while retaining junction-escape protection.
+- Retried bounded Windows sharing-lock rename failures, rechecking disk hashes before every attempt and retaining the destination until a successful rename.
 - Serialized language-server restarts, sent didClose, ignored diagnostics for obsolete workspaces/closed documents, and canceled obsolete terminal startups.
 - Cleared old workspace panes, diagnostics and pending per-document language updates; verified normal child-process cleanup.
 - Routed application shortcuts before editor/terminal input so Quick Open works from the terminal and Ctrl+Tab does not insert indentation.

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { spawn } from 'node:child_process';
 import { WorkspaceFS } from '../src/main/workspace';
 
 async function fixture() {
@@ -95,4 +96,17 @@ test('workspace root aliases resolve canonically while outside targets stay deni
     assert.equal(await fs.readFile(path.join(root, 'a.ts'), 'utf8'), 'saved through alias');
     await assert.rejects(workspace.create('../escape.ts', 'file'), /outside/);
   } finally { await fs.rm(parent, { recursive: true, force: true }); await cleanup(); }
+});
+
+test('Windows transient sharing locks are retried without deleting the destination', { skip: process.platform !== 'win32' }, async () => {
+  const { root, workspace, cleanup } = await fixture();
+  let locker: ReturnType<typeof spawn> | undefined;
+  try {
+    const file = path.join(root, 'locked.ts'); await fs.writeFile(file, 'base'); const data = await workspace.read(file);
+    locker = spawn('powershell.exe', ['-NoProfile', '-Command', '$stream = [System.IO.File]::Open($env:ORBIT_LOCK_TARGET, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read); Write-Output "LOCKED"; Start-Sleep -Milliseconds 500; $stream.Dispose()'], { env: { ...process.env, ORBIT_LOCK_TARGET: file }, windowsHide: true });
+    await new Promise<void>((resolve, reject) => { locker!.once('error', reject); locker!.once('exit', code => { if (code) reject(new Error('Lock helper exited ' + code)); }); locker!.stdout!.on('data', chunk => { if (String(chunk).includes('LOCKED')) resolve(); }); });
+    await workspace.save({ ...data, text: 'after sharing lock' });
+    assert.equal(await fs.readFile(file, 'utf8'), 'after sharing lock');
+    assert.deepEqual(await fs.readdir(root), ['locked.ts']);
+  } finally { locker?.kill(); await cleanup(); }
 });
