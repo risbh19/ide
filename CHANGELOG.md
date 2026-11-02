@@ -7,6 +7,7 @@
 - Serialized document and filesystem saves; preserved typing and line-ending changes during save acknowledgements and CRLF during Save As. Rechecked disk hashes before rename and after acknowledgement.
 - Kept dirty buffers open when typing continues during Save-and-close; protected deleted files and guarded repeated close requests.
 - Protected external reload/recovery reads from newer edits and watched explicitly opened/saved files.
+- Canonicalized workspace path aliases before containment checks and save queuing, including Windows runner short paths, while retaining junction-escape protection.
 - Serialized language-server restarts, sent didClose, ignored diagnostics for obsolete workspaces/closed documents, and canceled obsolete terminal startups.
 - Cleared old workspace panes, diagnostics and pending per-document language updates; verified normal child-process cleanup.
 - Routed application shortcuts before editor/terminal input so Quick Open works from the terminal and Ctrl+Tab does not insert indentation.

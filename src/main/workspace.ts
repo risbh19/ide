@@ -19,24 +19,27 @@ export class WorkspaceFS {
     if (!(await fs.stat(real)).isDirectory()) throw new Error('Choose a directory.');
     this.root = real; this.approved.clear();
   }
-  async approve(file: string): Promise<void> { this.approved.add(path.resolve(file)); }
-  async authorize(file: string): Promise<string> {
+  async approve(file: string): Promise<void> { this.approved.add(await this.canonical(file)); }
+  private async canonical(file: string): Promise<string> {
     const target = path.resolve(file);
-    if (!this.root || (!inside(this.root, target) && !this.approved.has(target))) throw new Error('This path is outside the open workspace.');
     // Follow the nearest existing ancestor, preventing symlink/junction escapes on writes too.
-    let ancestor = target;
+    let ancestor = target; const suffix: string[] = [];
     while (true) {
       try {
         const real = await fs.realpath(ancestor);
-        if (!inside(this.root, real) && !this.approved.has(target)) throw new Error('Symbolic link points outside the workspace.');
-        break;
+        return path.join(real, ...suffix);
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
         const parent = path.dirname(ancestor);
         if (parent === ancestor) throw error;
+        suffix.unshift(path.basename(ancestor));
         ancestor = parent;
       }
     }
+  }
+  async authorize(file: string): Promise<string> {
+    const target = await this.canonical(file);
+    if (!this.root || (!inside(this.root, target) && !this.approved.has(target))) throw new Error('This path is outside the open workspace.');
     return target;
   }
   async list(directory = this.root): Promise<FileEntry[]> {
@@ -68,9 +71,10 @@ export class WorkspaceFS {
     return { path: safe, text: raw.replace(/\r\n/g, '\n'), hash: hash(bytes), eol: raw.includes('\r\n') ? 'CRLF' : 'LF' };
   }
   async save(input: { path: string; text: string; hash: string; eol: 'LF' | 'CRLF'; force?: boolean }): Promise<FileData> {
-    const key = process.platform === 'win32' ? path.resolve(input.path).toLowerCase() : path.resolve(input.path);
+    const safe = await this.authorize(input.path);
+    const key = process.platform === 'win32' ? safe.toLowerCase() : safe;
     const previous = this.saves.get(key);
-    const work = (async () => { if (previous) await previous.catch(() => {}); return this.write(input); })();
+    const work = (async () => { if (previous) await previous.catch(() => {}); return this.write({ ...input, path: safe }); })();
     this.saves.set(key, work);
     try { return await work; } finally { if (this.saves.get(key) === work) this.saves.delete(key); }
   }

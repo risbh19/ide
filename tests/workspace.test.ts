@@ -81,3 +81,18 @@ test('opening enforces the measured 1 MiB limit without truncating oversized con
     assert.equal((await fs.stat(file)).size, 1024 * 1024 + 1);
   } finally { await cleanup(); }
 });
+
+test('workspace root aliases resolve canonically while outside targets stay denied', async () => {
+  const { root, workspace, cleanup } = await fixture();
+  const parent = await fs.mkdtemp(path.join(os.tmpdir(), 'orbit-alias-'));
+  const alias = path.join(parent, 'workspace');
+  try {
+    await fs.symlink(root, alias, process.platform === 'win32' ? 'junction' : 'dir');
+    await workspace.setRoot(alias); await fs.writeFile(path.join(root, 'a.ts'), 'base');
+    const data = await workspace.read(path.join(alias, 'a.ts'));
+    assert.equal(data.path, path.join(await fs.realpath(root), 'a.ts'));
+    await workspace.save({ ...data, path: path.join(alias, 'a.ts'), text: 'saved through alias' });
+    assert.equal(await fs.readFile(path.join(root, 'a.ts'), 'utf8'), 'saved through alias');
+    await assert.rejects(workspace.create('../escape.ts', 'file'), /outside/);
+  } finally { await fs.rm(parent, { recursive: true, force: true }); await cleanup(); }
+});

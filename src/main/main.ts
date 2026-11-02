@@ -54,7 +54,7 @@ function registerIPC() {
   handle('open-file', async () => {
     const result = await dialog.showOpenDialog(win, { title: 'Open file', defaultPath: workspace.root, properties: ['openFile'] });
     if (result.canceled) return null;
-    await workspace.approve(result.filePaths[0]); watcher?.add(result.filePaths[0]); return workspace.read(result.filePaths[0]);
+    await workspace.approve(result.filePaths[0]); const data = await workspace.read(result.filePaths[0]); watcher?.add(data.path); return data;
   });
   handle('save', input => workspace.save(input));
   handle('save-as', async input => {
@@ -63,9 +63,9 @@ function registerIPC() {
     const key = (file: string) => process.platform === 'win32' ? path.resolve(file).toLowerCase() : path.resolve(file);
     if (input.openPaths?.some((file: string) => key(file) === key(result.filePath!))) throw new Error('This file is already open in another tab. Close that tab before saving here.');
     await workspace.approve(result.filePath);
-    watcher?.add(result.filePath);
     const existing = await workspace.read(result.filePath).catch((error: NodeJS.ErrnoException) => { if (error.code === 'ENOENT') return null; throw error; });
-    return workspace.save({ path: result.filePath, text: input.text, hash: existing?.hash ?? '', eol: input.eol });
+    const data = await workspace.save({ path: result.filePath, text: input.text, hash: existing?.hash ?? '', eol: input.eol });
+    watcher?.add(data.path); return data;
   });
   handle('create', input => workspace.create(input.path, input.kind));
   handle('search', (query, sensitive) => workspace.search(query, sensitive));
