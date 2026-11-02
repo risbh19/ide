@@ -9,6 +9,7 @@
 - Protected external reload/recovery reads from newer edits and watched explicitly opened/saved files.
 - Canonicalized workspace path aliases before containment checks and save queuing, including Windows runner short paths, while retaining junction-escape protection.
 - Retried bounded Windows sharing-lock rename failures, rechecking disk hashes before every attempt and retaining the destination until a successful rename.
+- Ignored late IPC from destroyed windows, preventing the main-process "Object has been destroyed" error on shutdown.
 - Serialized language-server restarts, sent didClose, ignored diagnostics for obsolete workspaces/closed documents, and canceled obsolete terminal startups.
 - Cleared old workspace panes, diagnostics and pending per-document language updates; verified normal child-process cleanup.
 - Routed application shortcuts before editor/terminal input so Quick Open works from the terminal and Ctrl+Tab does not insert indentation.

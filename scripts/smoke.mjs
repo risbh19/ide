@@ -160,7 +160,16 @@ try {
     const restoredPage = await restored.firstWindow();
     await expect(restoredPage.locator('.code-input')).toHaveValue(/recovery marker/);
     console.log('PASS: unsaved document recovery across process restart');
-  } finally { await restored.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().forEach(window => window.destroy())); await restored.close(); }
+    const lateMessagesSafe = await restored.evaluate(({ BrowserWindow, ipcMain }) => {
+      const window = BrowserWindow.getAllWindows()[0], sender = window.webContents, senderFrame = sender.mainFrame;
+      window.destroy();
+      const event = { sender, senderFrame };
+      for (const [channel, ...args] of [['set-dirty', true], ['terminal-write', 'closed', 'x'], ['terminal-resize', 'closed', 80, 24], ['terminal-stop', 'closed'], ['close-ready'], ['window', 'close']]) ipcMain.emit(channel, event, ...args);
+      return true;
+    });
+    expect(lateMessagesSafe).toBe(true);
+    console.log('PASS: late IPC after window destruction is ignored without a main-process exception');
+  } finally { await restored.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().forEach(window => window.destroy())).catch(() => {}); await restored.close(); }
 } catch (error) {
   console.error('Smoke test failed:', error);
   const window = app.windows()[0];

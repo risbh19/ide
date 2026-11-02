@@ -28,6 +28,7 @@ jobs:
         if: always()
         with:
           name: desktop-test-screenshots
+          include-hidden-files: true
           path: |
             .orbit-test/**/*.png
             .orbit-test/**/results.json

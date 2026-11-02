@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, Menu } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain, Menu, type IpcMainEvent, type IpcMainInvokeEvent } from 'electron';
 import path from 'node:path';
 import fs from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
@@ -39,8 +39,13 @@ async function activateWorkspace(root: string) {
 }
 
 function registerIPC() {
+  const trusted = (event: IpcMainEvent | IpcMainInvokeEvent): boolean => {
+    // Late renderer messages can arrive after closed/destroyed; even reading webContents then throws.
+    try { return Boolean(win && !win.isDestroyed() && !win.webContents.isDestroyed() && event.sender === win.webContents && event.senderFrame === win.webContents.mainFrame); }
+    catch { return false; }
+  };
   const handle = (channel: string, callback: (...args: any[]) => any) => ipcMain.handle(channel, (event, ...args) => {
-    if (event.sender !== win.webContents || event.senderFrame !== win.webContents.mainFrame) throw new Error('Untrusted sender.');
+    if (!trusted(event)) throw new Error('Untrusted or closed sender.');
     return callback(...args);
   });
   handle('bootstrap', () => ({ workspace: describe(), version: app.getVersion() }));
@@ -91,13 +96,13 @@ function registerIPC() {
     return { id, shell: path.basename(shell) };
   });
   handle('confirm', (message, detail, buttons) => dialog.showMessageBox(win, { message, detail, buttons, type: 'question', cancelId: buttons.length - 1, defaultId: 0, noLink: true }).then(r => r.response));
-  ipcMain.on('terminal-write', (event, id, text) => { if (event.sender === win.webContents && event.senderFrame === win.webContents.mainFrame && typeof text === 'string') terminals.get(id)?.write(text); });
-  ipcMain.on('terminal-resize', (event, id, cols, rows) => { if (event.sender === win.webContents && Number.isFinite(cols) && Number.isFinite(rows)) { try { terminals.get(id)?.resize(Math.max(2, Math.min(500, cols)), Math.max(2, Math.min(200, rows))); } catch {} } });
-  ipcMain.on('terminal-stop', (event, id) => { if (event.sender === win.webContents) { try { terminals.get(id)?.kill(); } catch {} terminals.delete(id); } });
-  ipcMain.on('set-dirty', (event, value) => { if (event.sender === win.webContents) dirty = Boolean(value); });
-  ipcMain.on('close-ready', event => { if (event.sender === win.webContents) { allowClose = true; win.close(); } });
+  ipcMain.on('terminal-write', (event, id, text) => { if (trusted(event) && typeof text === 'string') terminals.get(id)?.write(text); });
+  ipcMain.on('terminal-resize', (event, id, cols, rows) => { if (trusted(event) && Number.isFinite(cols) && Number.isFinite(rows)) { try { terminals.get(id)?.resize(Math.max(2, Math.min(500, cols)), Math.max(2, Math.min(200, rows))); } catch {} } });
+  ipcMain.on('terminal-stop', (event, id) => { if (trusted(event)) { try { terminals.get(id)?.kill(); } catch {} terminals.delete(id); } });
+  ipcMain.on('set-dirty', (event, value) => { if (trusted(event)) dirty = Boolean(value); });
+  ipcMain.on('close-ready', event => { if (trusted(event)) { allowClose = true; win.close(); } });
   ipcMain.on('window', (event, action) => {
-    if (event.sender !== win.webContents) return;
+    if (!trusted(event)) return;
     if (action === 'minimize') win.minimize();
     if (action === 'maximize') win.isMaximized() ? win.unmaximize() : win.maximize();
     if (action === 'close') win.close();
