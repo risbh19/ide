@@ -3,6 +3,7 @@ import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { setTimeout as delay } from 'node:timers/promises';
 import type { FileData, FileEntry, SearchHit } from '../shared/types';
 
 const exec = promisify(execFile);
@@ -13,29 +14,33 @@ const inside = (root: string, target: string) => { const relative = path.relativ
 export class WorkspaceFS {
   root = '';
   private approved = new Set<string>();
+  private saves = new Map<string, Promise<FileData>>();
   async setRoot(root: string): Promise<void> {
     const real = await fs.realpath(root);
     if (!(await fs.stat(real)).isDirectory()) throw new Error('Choose a directory.');
     this.root = real; this.approved.clear();
   }
-  async approve(file: string): Promise<void> { this.approved.add(path.resolve(file)); }
-  async authorize(file: string): Promise<string> {
+  async approve(file: string): Promise<void> { this.approved.add(await this.canonical(file)); }
+  private async canonical(file: string): Promise<string> {
     const target = path.resolve(file);
-    if (!this.root || (!inside(this.root, target) && !this.approved.has(target))) throw new Error('This path is outside the open workspace.');
     // Follow the nearest existing ancestor, preventing symlink/junction escapes on writes too.
-    let ancestor = target;
+    let ancestor = target; const suffix: string[] = [];
     while (true) {
       try {
         const real = await fs.realpath(ancestor);
-        if (!inside(this.root, real) && !this.approved.has(target)) throw new Error('Symbolic link points outside the workspace.');
-        break;
+        return path.join(real, ...suffix);
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
         const parent = path.dirname(ancestor);
         if (parent === ancestor) throw error;
+        suffix.unshift(path.basename(ancestor));
         ancestor = parent;
       }
     }
+  }
+  async authorize(file: string): Promise<string> {
+    const target = await this.canonical(file);
+    if (!this.root || (!inside(this.root, target) && !this.approved.has(target))) throw new Error('This path is outside the open workspace.');
     return target;
   }
   async list(directory = this.root): Promise<FileEntry[]> {
@@ -59,7 +64,7 @@ export class WorkspaceFS {
   }
   async read(file: string): Promise<FileData> {
     const safe = await this.authorize(file);
-    if ((await fs.stat(safe)).size > 5 * 1024 * 1024) throw new Error('This editor supports text files up to 5 MB.');
+    if ((await fs.stat(safe)).size > 1024 * 1024) throw new Error('This editor supports UTF-8 text files up to 1 MiB. Larger files exceed the verified desktop performance limit.');
     const bytes = await fs.readFile(safe);
     if (bytes.includes(0)) throw new Error('Binary files cannot be opened in the text editor.');
     try { new TextDecoder('utf-8', { fatal: true }).decode(bytes); } catch { throw new Error('This file is not valid UTF-8 text.'); }
@@ -67,6 +72,14 @@ export class WorkspaceFS {
     return { path: safe, text: raw.replace(/\r\n/g, '\n'), hash: hash(bytes), eol: raw.includes('\r\n') ? 'CRLF' : 'LF' };
   }
   async save(input: { path: string; text: string; hash: string; eol: 'LF' | 'CRLF'; force?: boolean }): Promise<FileData> {
+    const safe = await this.authorize(input.path);
+    const key = process.platform === 'win32' ? safe.toLowerCase() : safe;
+    const previous = this.saves.get(key);
+    const work = (async () => { if (previous) await previous.catch(() => {}); return this.write({ ...input, path: safe }); })();
+    this.saves.set(key, work);
+    try { return await work; } finally { if (this.saves.get(key) === work) this.saves.delete(key); }
+  }
+  private async write(input: { path: string; text: string; hash: string; eol: 'LF' | 'CRLF'; force?: boolean }): Promise<FileData> {
     const safe = await this.authorize(input.path);
     let existing: Buffer | null = null;
     try { existing = await fs.readFile(safe); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
@@ -76,7 +89,18 @@ export class WorkspaceFS {
     try {
       const mode = existing ? (await fs.stat(safe)).mode : undefined;
       await fs.writeFile(temporary, raw, { encoding: 'utf8', flag: 'wx', mode });
-      await fs.rename(temporary, safe);
+      for (let attempt = 0; ; attempt++) {
+        // Recheck on every attempt; a writer can change the target while Windows holds a sharing lock.
+        if (!input.force) {
+          const latest = await fs.readFile(safe).catch((error: NodeJS.ErrnoException) => { if (error.code === 'ENOENT') return null; throw error; });
+          if (latest ? hash(latest) !== input.hash : Boolean(input.hash)) throw new Error('CONFLICT: The file changed on disk.');
+        }
+        try { await fs.rename(temporary, safe); break; }
+        catch (error) {
+          if (process.platform !== 'win32' || attempt >= 6 || !['EPERM', 'EACCES', 'EBUSY'].includes((error as NodeJS.ErrnoException).code ?? '')) throw error;
+          await delay(25 * 2 ** attempt);
+        }
+      }
     } finally { await fs.rm(temporary, { force: true }).catch(() => {}); }
     return { path: safe, text: input.text, hash: hash(raw), eol: input.eol };
   }

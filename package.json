@@ -5,7 +5,7 @@
   "description": "A focused desktop IDE with an editor built from scratch.",
   "private": true,
   "packageManager": "pnpm@11.25.0",
-  "engines": { "node": ">=22.18.0", "pnpm": ">=10" },
+  "engines": { "node": ">=24.22.1 <25", "pnpm": "11.25.0" },
   "type": "module",
   "main": "dist/main.cjs",
   "scripts": {
@@ -14,8 +14,10 @@
     "start": "node scripts/start.mjs",
     "typecheck": "tsc --noEmit",
     "test": "tsx --test tests/*.test.ts",
-    "test:app": "node scripts/smoke.mjs",
-    "test:package": "node scripts/smoke.mjs --packaged",
+    "test:app": "node scripts/smoke.mjs && node scripts/reliability-smoke.mjs",
+    "test:package": "node scripts/smoke.mjs --packaged && node scripts/reliability-smoke.mjs --packaged",
+    "benchmark": "tsx scripts/benchmark.ts",
+    "benchmark:desktop": "node scripts/desktop-performance.mjs",
     "package": "node scripts/package.mjs"
   },
   "dependencies": {

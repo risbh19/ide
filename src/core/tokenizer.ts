@@ -8,7 +8,10 @@ const types = new Set('any boolean number string never unknown object Promise Ar
 export class Tokenizer {
   private lines: Line[] = [];
   private language = '';
+  private text = '';
+  private html: string[] = [];
   tokenize(text: string, language: string): string[] {
+    if (text === this.text && language === this.language && this.html.length) return this.html;
     if (language !== this.language) { this.lines = []; this.language = language; }
     const rows = text.split('\n');
     let state: State = 'normal';
@@ -50,7 +53,8 @@ export class Tokenizer {
       result.push({ input: rows[i], state: start, end: state, html: tokens.join('') || ' ' });
     }
     this.lines = result;
-    return result.map(line => line.html);
+    this.text = text;
+    return this.html = result.map(line => line.html);
   }
 }
 

@@ -54,3 +54,21 @@ test('incremental lexer propagates multiline comment state and escapes markup', 
   assert.ok(rows[1].includes('tok-keyword'));
   assert.ok(!rows[1].includes('tok-comment'));
 });
+
+test('native beforeinput hints preserve surrogate pairs and undo selection', () => {
+  const table = new PieceTable('x🌍y'); table.selection = [{ anchor: 3, head: 3 }];
+  table.reconcile('xy', [{ anchor: 1, head: 1 }], { selection: table.selection[0], type: 'deleteContentBackward' });
+  assert.equal(table.text, 'xy'); table.undo(); assert.equal(table.text, 'x🌍y');
+  assert.deepEqual(table.selection, [{ anchor: 3, head: 3 }]);
+  table.reconcile('x你好y', [{ anchor: 3, head: 3 }], { selection: { anchor: 1, head: 3 }, type: 'insertText' });
+  assert.equal(table.text, 'x你好y');
+});
+
+test('bounded history compacts discarded addition text without corrupting undo', () => {
+  const table = new PieceTable('base');
+  for (let i = 0; i < 45; i++) table.apply([{ start: 0, end: table.length, text: String(i).padEnd(1024 * 1024, 'x') }]);
+  assert.ok(table.statistics().additions < 32 * 1024 * 1024, JSON.stringify(table.statistics()));
+  assert.ok(table.statistics().undo < 20);
+  assert.ok(table.undo()); assert.ok(table.text.startsWith('43'));
+  assert.ok(table.redo()); assert.ok(table.text.startsWith('44'));
+});
